@@ -5,7 +5,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use muconde_agent::{MuConDeAgent, MuConDeAgentConfig, SystemCommandRunner, SystemHealthProber};
+use muconde_agent::{
+    builtin_catalog, IntegrationTestSelection, MuConDeAgent, MuConDeAgentConfig,
+    SystemCommandRunner, SystemHealthProber,
+};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -34,6 +37,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .map(PathBuf::from);
 
+    // Contract `integration_tests` selector: "all" (default) or a comma-separated list.
+    let integration_tests = std::env::var("MUCONDE_INTEGRATION_TESTS")
+        .map(|v| {
+            let names: Vec<String> = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            IntegrationTestSelection::from_names(&names)
+        })
+        .unwrap_or_default();
+
     let config = MuConDeAgentConfig {
         node_id,
         listen_addr,
@@ -44,6 +59,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         default_warmup_timeout_secs: 30,
         required_consecutive_successes: 3,
         collector_addr: std::env::var("MUOBSERVE_COLLECTOR_ADDR").ok(),
+        integration_tests,
+        gate_catalog: builtin_catalog(),
     };
 
     let runner = Arc::new(SystemCommandRunner::new());

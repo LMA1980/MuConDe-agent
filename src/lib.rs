@@ -7,16 +7,21 @@
 pub mod agent;
 pub mod btrfs;
 pub mod error;
+pub mod gate;
 pub mod slot;
 pub mod telemetry;
 pub mod watchdog;
 
-pub use agent::{build_tls_server_config, MuConDeAgent, MuConDeAgentConfig};
+pub use agent::{build_tls_server_config, send_it_progress, MuConDeAgent, MuConDeAgentConfig};
 pub use btrfs::{
     validate_service_name, BtrfsManager, CommandOutput, CommandRunner, MockCommandRunner,
     SystemCommandRunner, ALLOWED_SERVICES,
 };
 pub use error::AgentError;
+pub use gate::{
+    builtin_catalog, expand_integration_tests, GateTest, GateTracker, IntegrationTestSelection,
+    TEST_HEALTH_ENDPOINT_READY, TEST_SYSTEMD_UNIT_ACTIVE,
+};
 pub use slot::{Slot, SlotManager, SwapReceipt};
 pub use telemetry::{
     now_unix_nano, trace_context_for_deployment, MuObserveCollectorSink, RecordingTelemetrySink,
