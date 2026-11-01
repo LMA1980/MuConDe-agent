@@ -27,9 +27,14 @@ use tokio_rustls::TlsAcceptor;
 use crate::btrfs::{BtrfsManager, CommandRunner, SystemCommandRunner};
 use crate::error::AgentError;
 use crate::slot::{Slot, SlotManager};
+use crate::telemetry::{
+    now_unix_nano, trace_context_for_deployment, MuObserveCollectorSink, TelemetrySink,
+    AGENT_SERVICE_NAME,
+};
 use crate::watchdog::{
     now_epoch_ms, HealthProber, SystemHealthProber, WatchdogMonitor, WatchdogOutcome,
 };
+use muobserve_ipc::{OtelMetricEntry, OtelSpanEntry};
 
 /// Configuration parameters for the MuConDe node agent daemon.
 #[derive(Debug, Clone)]
@@ -42,6 +47,7 @@ pub struct MuConDeAgentConfig {
     pub tls_key_path: Option<PathBuf>,
     pub default_warmup_timeout_secs: u64,
     pub required_consecutive_successes: u32,
+    pub collector_addr: Option<String>,
 }
 
 impl Default for MuConDeAgentConfig {
@@ -55,6 +61,7 @@ impl Default for MuConDeAgentConfig {
             tls_key_path: None,
             default_warmup_timeout_secs: 30,
             required_consecutive_successes: 3,
+            collector_addr: std::env::var("MUOBSERVE_COLLECTOR_ADDR").ok(),
         }
     }
 }
@@ -112,6 +119,7 @@ pub struct MuConDeAgent {
     btrfs_manager: Arc<BtrfsManager>,
     slot_manager: Arc<SlotManager>,
     watchdog_monitor: Arc<WatchdogMonitor>,
+    telemetry_sink: Arc<dyn TelemetrySink>,
 }
 
 impl MuConDeAgent {
@@ -127,13 +135,26 @@ impl MuConDeAgent {
             slot_manager.clone(),
             prober,
         ));
+        let telemetry_sink = Arc::new(MuObserveCollectorSink::new(config.collector_addr.clone()));
 
         Self {
             config,
             btrfs_manager,
             slot_manager,
             watchdog_monitor,
+            telemetry_sink,
         }
+    }
+
+    /// Replaces the default `MuObserveCollectorSink` with a custom [`TelemetrySink`].
+    #[must_use]
+    pub fn with_telemetry_sink(mut self, telemetry_sink: Arc<dyn TelemetrySink>) -> Self {
+        self.telemetry_sink = telemetry_sink;
+        self
+    }
+
+    pub fn telemetry_sink(&self) -> &Arc<dyn TelemetrySink> {
+        &self.telemetry_sink
     }
 
     pub fn default_with_root(node_id: &str, root: PathBuf) -> Self {
@@ -195,6 +216,9 @@ impl MuConDeAgent {
                         "Received StageDeploymentRequest"
                     );
 
+                    let start_ns = now_unix_nano();
+                    let trace_ctx = trace_context_for_deployment(&req.deployment_id, 1);
+
                     // Locate staging candidate binary path
                     let candidate_path = self
                         .config
@@ -207,6 +231,58 @@ impl MuConDeAgent {
                         &candidate_path,
                         "",
                     );
+                    let end_ns = now_unix_nano().max(start_ns);
+                    let duration_ns = (end_ns - start_ns) as u64;
+
+                    let span = OtelSpanEntry {
+                        trace_id: trace_ctx.trace_id_hex(),
+                        span_id: trace_ctx.span_id_hex(),
+                        parent_span_id: None,
+                        service_name: AGENT_SERVICE_NAME.to_string(),
+                        node_id: self.config.node_id.clone(),
+                        span_name: "muconde.agent.stage_deployment".to_string(),
+                        span_kind: "SERVER".to_string(),
+                        start_time_unix_nano: start_ns,
+                        end_time_unix_nano: end_ns,
+                        duration_ns,
+                        status_code: if resp.staged_ok { "OK" } else { "ERROR" }.to_string(),
+                        status_message: resp.error_message.clone(),
+                        attributes_json: serde_json::json!({
+                            "deployment_id": req.deployment_id,
+                            "lease_id": req.lease_id,
+                            "service_name": req.service_name,
+                            "artifact_sha256": req.artifact_sha256,
+                            "target_slot": format!("{:?}", req.target_slot),
+                            "btrfs_subvolume_path": resp.btrfs_subvolume_path,
+                            "staged_ok": resp.staged_ok,
+                        })
+                        .to_string(),
+                    };
+
+                    let metric = OtelMetricEntry {
+                        timestamp_unix_nano: end_ns,
+                        service_name: AGENT_SERVICE_NAME.to_string(),
+                        node_id: self.config.node_id.clone(),
+                        metric_name: "muconde.agent.stage_duration_ms".to_string(),
+                        metric_unit: "ms".to_string(),
+                        value_f64: (duration_ns as f64) / 1_000_000.0,
+                        arch: std::env::consts::ARCH.to_string(),
+                        cpu_cluster: None,
+                        vlen_bits: None,
+                        memlock_used_bytes: None,
+                        memlock_limit_bytes: None,
+                        trace_id: Some(trace_ctx.trace_id_hex()),
+                        span_id: Some(trace_ctx.span_id_hex()),
+                        attributes_json: serde_json::json!({
+                            "deployment_id": req.deployment_id,
+                            "service_name": req.service_name,
+                            "staged_ok": resp.staged_ok,
+                        })
+                        .to_string(),
+                    };
+
+                    self.telemetry_sink.emit_spans(vec![span]).await;
+                    self.telemetry_sink.emit_metrics(vec![metric]).await;
 
                     let resp_bytes = fory
                         .serialize(&resp)
@@ -234,11 +310,70 @@ impl MuConDeAgent {
                         "Received SlotSwapCommand"
                     );
 
+                    let swap_start_ns = now_unix_nano();
+                    let swap_trace_ctx = trace_context_for_deployment(&cmd.deployment_id, 2);
+
                     // 1. Perform atomic pointer swap
                     let target_slot = Slot::from(cmd.to_slot);
                     let _receipt = self
                         .slot_manager
                         .atomic_swap_active_slot(&cmd.service_name, target_slot)?;
+
+                    let swap_end_ns = now_unix_nano().max(swap_start_ns);
+                    let swap_dur_ns = (swap_end_ns - swap_start_ns) as u64;
+
+                    let swap_span = OtelSpanEntry {
+                        trace_id: swap_trace_ctx.trace_id_hex(),
+                        span_id: swap_trace_ctx.span_id_hex(),
+                        parent_span_id: None,
+                        service_name: AGENT_SERVICE_NAME.to_string(),
+                        node_id: self.config.node_id.clone(),
+                        span_name: "muconde.agent.slot_swap".to_string(),
+                        span_kind: "SERVER".to_string(),
+                        start_time_unix_nano: swap_start_ns,
+                        end_time_unix_nano: swap_end_ns,
+                        duration_ns: swap_dur_ns,
+                        status_code: "OK".to_string(),
+                        status_message: None,
+                        attributes_json: serde_json::json!({
+                            "deployment_id": cmd.deployment_id,
+                            "lease_id": cmd.lease_id,
+                            "service_name": cmd.service_name,
+                            "from_slot": format!("{:?}", cmd.from_slot),
+                            "to_slot": format!("{:?}", cmd.to_slot),
+                            "subvolume": target_slot.as_str(),
+                            "systemd_unit": cmd.systemd_unit,
+                        })
+                        .to_string(),
+                    };
+
+                    let slot_metric = OtelMetricEntry {
+                        timestamp_unix_nano: swap_end_ns,
+                        service_name: AGENT_SERVICE_NAME.to_string(),
+                        node_id: self.config.node_id.clone(),
+                        metric_name: "muconde.agent.active_slot".to_string(),
+                        metric_unit: "slot".to_string(),
+                        value_f64: match target_slot {
+                            Slot::A => 0.0,
+                            Slot::B => 1.0,
+                        },
+                        arch: std::env::consts::ARCH.to_string(),
+                        cpu_cluster: None,
+                        vlen_bits: None,
+                        memlock_used_bytes: None,
+                        memlock_limit_bytes: None,
+                        trace_id: Some(swap_trace_ctx.trace_id_hex()),
+                        span_id: Some(swap_trace_ctx.span_id_hex()),
+                        attributes_json: serde_json::json!({
+                            "deployment_id": cmd.deployment_id,
+                            "service_name": cmd.service_name,
+                            "subvolume": target_slot.as_str(),
+                        })
+                        .to_string(),
+                    };
+
+                    self.telemetry_sink.emit_spans(vec![swap_span]).await;
+                    self.telemetry_sink.emit_metrics(vec![slot_metric]).await;
 
                     // 2. Start warmup watchdog monitoring
                     let (tx, mut rx) = mpsc::channel(32);
@@ -260,8 +395,58 @@ impl MuConDeAgent {
                             .await
                     });
 
-                    // Forward telemetry ticks over stream
+                    // Forward telemetry ticks over stream and emit OtelMetricEntry batches
                     while let Some(telem) = rx.recv().await {
+                        let ts_ns = now_unix_nano();
+                        let probe_attrs = serde_json::json!({
+                            "deployment_id": telem.deployment_id,
+                            "service_name": telem.service_name,
+                            "active_slot": format!("{:?}", telem.active_slot),
+                            "systemd_active": telem.systemd_active,
+                            "health_endpoint_ok": telem.health_endpoint_ok,
+                        })
+                        .to_string();
+
+                        let probe_metrics = vec![
+                            OtelMetricEntry {
+                                timestamp_unix_nano: ts_ns,
+                                service_name: AGENT_SERVICE_NAME.to_string(),
+                                node_id: self.config.node_id.clone(),
+                                metric_name: "muconde.agent.slot_probe_latency_ms".to_string(),
+                                metric_unit: "ms".to_string(),
+                                value_f64: f64::from(telem.probe_latency_ms),
+                                arch: std::env::consts::ARCH.to_string(),
+                                cpu_cluster: None,
+                                vlen_bits: None,
+                                memlock_used_bytes: None,
+                                memlock_limit_bytes: None,
+                                trace_id: Some(swap_trace_ctx.trace_id_hex()),
+                                span_id: Some(swap_trace_ctx.span_id_hex()),
+                                attributes_json: probe_attrs.clone(),
+                            },
+                            OtelMetricEntry {
+                                timestamp_unix_nano: ts_ns,
+                                service_name: AGENT_SERVICE_NAME.to_string(),
+                                node_id: self.config.node_id.clone(),
+                                metric_name: "muconde.agent.slot_probe_healthy".to_string(),
+                                metric_unit: "1".to_string(),
+                                value_f64: if telem.systemd_active && telem.health_endpoint_ok {
+                                    1.0
+                                } else {
+                                    0.0
+                                },
+                                arch: std::env::consts::ARCH.to_string(),
+                                cpu_cluster: None,
+                                vlen_bits: None,
+                                memlock_used_bytes: None,
+                                memlock_limit_bytes: None,
+                                trace_id: Some(swap_trace_ctx.trace_id_hex()),
+                                span_id: Some(swap_trace_ctx.span_id_hex()),
+                                attributes_json: probe_attrs,
+                            },
+                        ];
+                        self.telemetry_sink.emit_metrics(probe_metrics).await;
+
                         let telem_bytes = fory
                             .serialize(&telem)
                             .map_err(|e| AgentError::Serialization(e.to_string()))?;
@@ -275,7 +460,37 @@ impl MuConDeAgent {
                     }
 
                     match outcome_task.await {
-                        Ok(Ok(WatchdogOutcome::RolledBack { report, taint, .. })) => {
+                        Ok(Ok(WatchdogOutcome::RolledBack {
+                            report,
+                            taint,
+                            elapsed_rollback_ms,
+                        })) => {
+                            let rb_ctx = swap_trace_ctx.next_deterministic_child(1);
+                            let rb_end_ns = now_unix_nano().max(swap_end_ns);
+                            let rb_span = OtelSpanEntry {
+                                trace_id: rb_ctx.trace_id_hex(),
+                                span_id: rb_ctx.span_id_hex(),
+                                parent_span_id: Some(swap_trace_ctx.span_id_hex()),
+                                service_name: AGENT_SERVICE_NAME.to_string(),
+                                node_id: self.config.node_id.clone(),
+                                span_name: "muconde.agent.rollback".to_string(),
+                                span_kind: "INTERNAL".to_string(),
+                                start_time_unix_nano: swap_end_ns,
+                                end_time_unix_nano: rb_end_ns,
+                                duration_ns: elapsed_rollback_ms * 1_000_000,
+                                status_code: "ERROR".to_string(),
+                                status_message: Some(taint.reason.clone()),
+                                attributes_json: serde_json::json!({
+                                    "deployment_id": cmd.deployment_id,
+                                    "service_name": cmd.service_name,
+                                    "restore_slot": "@a",
+                                    "reason": taint.reason,
+                                    "elapsed_rollback_ms": elapsed_rollback_ms,
+                                })
+                                .to_string(),
+                            };
+                            self.telemetry_sink.emit_spans(vec![rb_span]).await;
+
                             // Send IntegrationTestReport
                             let report_bytes = fory
                                 .serialize(&*report)
@@ -327,8 +542,64 @@ impl MuConDeAgent {
                         "Received RollbackCommand from controller"
                     );
 
-                    let (report, taint, _elapsed_ms) =
+                    let rb_start_ns = now_unix_nano();
+                    let rb_trace_ctx = trace_context_for_deployment(&cmd.deployment_id, 3);
+
+                    let (report, taint, elapsed_ms) =
                         self.watchdog_monitor.handle_rollback_command(&cmd)?;
+
+                    let rb_end_ns = now_unix_nano().max(rb_start_ns);
+                    let rb_dur_ns = (rb_end_ns - rb_start_ns) as u64;
+
+                    let rb_span = OtelSpanEntry {
+                        trace_id: rb_trace_ctx.trace_id_hex(),
+                        span_id: rb_trace_ctx.span_id_hex(),
+                        parent_span_id: None,
+                        service_name: AGENT_SERVICE_NAME.to_string(),
+                        node_id: self.config.node_id.clone(),
+                        span_name: "muconde.agent.rollback".to_string(),
+                        span_kind: "SERVER".to_string(),
+                        start_time_unix_nano: rb_start_ns,
+                        end_time_unix_nano: rb_end_ns,
+                        duration_ns: rb_dur_ns,
+                        status_code: "OK".to_string(),
+                        status_message: Some(cmd.reason.clone()),
+                        attributes_json: serde_json::json!({
+                            "deployment_id": cmd.deployment_id,
+                            "lease_id": cmd.lease_id,
+                            "service_name": cmd.service_name,
+                            "restore_slot": format!("{:?}", cmd.restore_slot),
+                            "failed_artifact_sha256": cmd.failed_artifact_sha256,
+                            "reason": cmd.reason,
+                            "elapsed_rollback_ms": elapsed_ms,
+                        })
+                        .to_string(),
+                    };
+
+                    let rb_metric = OtelMetricEntry {
+                        timestamp_unix_nano: rb_end_ns,
+                        service_name: AGENT_SERVICE_NAME.to_string(),
+                        node_id: self.config.node_id.clone(),
+                        metric_name: "muconde.agent.rollback_duration_ms".to_string(),
+                        metric_unit: "ms".to_string(),
+                        value_f64: elapsed_ms as f64,
+                        arch: std::env::consts::ARCH.to_string(),
+                        cpu_cluster: None,
+                        vlen_bits: None,
+                        memlock_used_bytes: None,
+                        memlock_limit_bytes: None,
+                        trace_id: Some(rb_trace_ctx.trace_id_hex()),
+                        span_id: Some(rb_trace_ctx.span_id_hex()),
+                        attributes_json: serde_json::json!({
+                            "deployment_id": cmd.deployment_id,
+                            "service_name": cmd.service_name,
+                            "restore_slot": "@a",
+                        })
+                        .to_string(),
+                    };
+
+                    self.telemetry_sink.emit_spans(vec![rb_span]).await;
+                    self.telemetry_sink.emit_metrics(vec![rb_metric]).await;
 
                     let report_bytes = fory
                         .serialize(&report)
@@ -408,6 +679,7 @@ impl MuConDeAgent {
                 let agent_btrfs = self.btrfs_manager.clone();
                 let agent_slot = self.slot_manager.clone();
                 let agent_watchdog = self.watchdog_monitor.clone();
+                let agent_telemetry = self.telemetry_sink.clone();
                 let config = self.config.clone();
 
                 tokio::spawn(async move {
@@ -418,6 +690,7 @@ impl MuConDeAgent {
                                 btrfs_manager: agent_btrfs,
                                 slot_manager: agent_slot,
                                 watchdog_monitor: agent_watchdog,
+                                telemetry_sink: agent_telemetry,
                             };
                             if let Err(e) = agent.handle_connection(tls_stream).await {
                                 tracing::error!("Connection error: {}", e);
@@ -432,6 +705,7 @@ impl MuConDeAgent {
                 let agent_btrfs = self.btrfs_manager.clone();
                 let agent_slot = self.slot_manager.clone();
                 let agent_watchdog = self.watchdog_monitor.clone();
+                let agent_telemetry = self.telemetry_sink.clone();
                 let config = self.config.clone();
 
                 tokio::spawn(async move {
@@ -440,6 +714,7 @@ impl MuConDeAgent {
                         btrfs_manager: agent_btrfs,
                         slot_manager: agent_slot,
                         watchdog_monitor: agent_watchdog,
+                        telemetry_sink: agent_telemetry,
                     };
                     if let Err(e) = agent.handle_connection(stream).await {
                         tracing::error!("Connection error: {}", e);
@@ -750,5 +1025,119 @@ mod tests {
 
         drop(client);
         let _ = agent_task.await;
+    }
+
+    #[tokio::test]
+    async fn test_agent_emits_otel_spans_and_metrics_for_staging_swap_probes_and_rollback() {
+        use crate::telemetry::RecordingTelemetrySink;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("muconde");
+        let service = "action-runner";
+
+        let srv_dir = root.join(service);
+        fs::create_dir_all(srv_dir.join("@a")).unwrap();
+        fs::create_dir_all(srv_dir.join("@b")).unwrap();
+
+        let staging_dir = root.join("staging");
+        fs::create_dir_all(&staging_dir).unwrap();
+        let artifact_hash = "sha256-candidate-otel";
+        fs::write(staging_dir.join(artifact_hash), b"candidate_binary").unwrap();
+
+        let runner = Arc::new(MockCommandRunner::new(true));
+        let prober = Arc::new(MockHealthProber::new(true));
+        let recorder = Arc::new(RecordingTelemetrySink::new());
+
+        let config = MuConDeAgentConfig {
+            node_id: "worker-riscv64".into(),
+            muconde_root: root.clone(),
+            required_consecutive_successes: 2,
+            ..Default::default()
+        };
+
+        let agent = Arc::new(
+            MuConDeAgent::new(config, runner, prober).with_telemetry_sink(recorder.clone()),
+        );
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+
+        let agent_server = agent.clone();
+        let agent_task = tokio::spawn(async move {
+            agent_server.handle_connection(server).await.unwrap();
+        });
+
+        let fory = create_fory_runtime().unwrap();
+
+        // 1. StageDeployment
+        let stage_req = StageDeploymentRequest {
+            deployment_id: "dep-otel-1".into(),
+            lease_id: "lease-otel-1".into(),
+            service_name: service.into(),
+            artifact_sha256: artifact_hash.into(),
+            target_slot: DeploymentSlot::SlotB,
+        };
+        let req_bytes = fory.serialize(&stage_req).unwrap();
+        let req_header = IpcHeader::new(MSG_TYPE_STAGE_DEPLOY_REQ, req_bytes.len() as u32, 0, 1);
+        write_frame(&mut client, &req_header, &req_bytes)
+            .await
+            .unwrap();
+        let (_resp_hdr, _resp_payload) = read_frame(&mut client).await.unwrap();
+
+        // 2. SlotSwap + Health Probes
+        let swap_cmd = SlotSwapCommand {
+            deployment_id: "dep-otel-1".into(),
+            lease_id: "lease-otel-1".into(),
+            service_name: service.into(),
+            from_slot: DeploymentSlot::SlotA,
+            to_slot: DeploymentSlot::SlotB,
+            systemd_unit: "action-runner.service".into(),
+            warmup_timeout_secs: 5,
+        };
+        let swap_bytes = fory.serialize(&swap_cmd).unwrap();
+        let swap_header = IpcHeader::new(MSG_TYPE_SLOT_SWAP, swap_bytes.len() as u32, 0, 2);
+        write_frame(&mut client, &swap_header, &swap_bytes)
+            .await
+            .unwrap();
+
+        let mut probes_received = 0;
+        while probes_received < 2 {
+            let (hdr, _payload) = read_frame(&mut client).await.unwrap();
+            if hdr.msg_type == MSG_TYPE_HEALTH_PROBE {
+                probes_received += 1;
+            }
+        }
+
+        // 3. RollbackCommand
+        let rollback_cmd = RollbackCommand {
+            deployment_id: "dep-otel-1".into(),
+            lease_id: "lease-otel-1".into(),
+            service_name: service.into(),
+            restore_slot: DeploymentSlot::SlotA,
+            failed_artifact_sha256: artifact_hash.into(),
+            reason: "SLO latency breach".into(),
+        };
+        let rb_bytes = fory.serialize(&rollback_cmd).unwrap();
+        let rb_header = IpcHeader::new(MSG_TYPE_ROLLBACK, rb_bytes.len() as u32, 0, 3);
+        write_frame(&mut client, &rb_header, &rb_bytes)
+            .await
+            .unwrap();
+        let _ = read_frame(&mut client).await.unwrap();
+        let _ = read_frame(&mut client).await.unwrap();
+
+        drop(client);
+        let _ = agent_task.await;
+
+        let spans = recorder.recorded_spans().await;
+        let span_names: Vec<&str> = spans.iter().map(|s| s.span_name.as_str()).collect();
+        assert!(span_names.contains(&"muconde.agent.stage_deployment"));
+        assert!(span_names.contains(&"muconde.agent.slot_swap"));
+        assert!(span_names.contains(&"muconde.agent.rollback"));
+
+        let metrics = recorder.recorded_metrics().await;
+        let metric_names: Vec<&str> = metrics.iter().map(|m| m.metric_name.as_str()).collect();
+        assert!(metric_names.contains(&"muconde.agent.stage_duration_ms"));
+        assert!(metric_names.contains(&"muconde.agent.active_slot"));
+        assert!(metric_names.contains(&"muconde.agent.slot_probe_latency_ms"));
+        assert!(metric_names.contains(&"muconde.agent.slot_probe_healthy"));
+        assert!(metric_names.contains(&"muconde.agent.rollback_duration_ms"));
     }
 }
