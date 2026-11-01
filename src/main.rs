@@ -43,6 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tls_key_path,
         default_warmup_timeout_secs: 30,
         required_consecutive_successes: 3,
+        collector_addr: std::env::var("MUOBSERVE_COLLECTOR_ADDR").ok(),
     };
 
     let runner = Arc::new(SystemCommandRunner::new());

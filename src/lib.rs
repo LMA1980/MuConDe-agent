@@ -8,6 +8,7 @@ pub mod agent;
 pub mod btrfs;
 pub mod error;
 pub mod slot;
+pub mod telemetry;
 pub mod watchdog;
 
 pub use agent::{build_tls_server_config, MuConDeAgent, MuConDeAgentConfig};
@@ -17,6 +18,10 @@ pub use btrfs::{
 };
 pub use error::AgentError;
 pub use slot::{Slot, SlotManager, SwapReceipt};
+pub use telemetry::{
+    now_unix_nano, trace_context_for_deployment, MuObserveCollectorSink, RecordingTelemetrySink,
+    TelemetrySink, AGENT_SERVICE_NAME, DEFAULT_COLLECTOR_ADDR,
+};
 pub use watchdog::{
     now_epoch_ms, HealthProber, MockHealthProber, ProbeResult, SystemHealthProber, WatchdogMonitor,
     WatchdogOutcome,

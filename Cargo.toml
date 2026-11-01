@@ -8,6 +8,7 @@ repository = "https://github.com/LMA1980/MuConDe-agent"
 
 [dependencies]
 muconde-ipc = { git = "https://github.com/LMA1980/MuConDe-ipc.git", branch = "main" }
+muobserve-ipc = { git = "https://github.com/LMA1980/MuObserve-ipc.git" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "process", "net"] }
 tokio-rustls = "0.26"
 rustls = "0.23"
