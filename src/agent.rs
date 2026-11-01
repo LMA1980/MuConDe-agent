@@ -9,12 +9,12 @@ use std::sync::Arc;
 
 use muconde_ipc::framing::{
     read_frame, write_frame, IpcHeader, MSG_TYPE_ARTIFACT_TAINT, MSG_TYPE_HEALTH_PROBE,
-    MSG_TYPE_HEARTBEAT, MSG_TYPE_IT_REPORT, MSG_TYPE_ROLLBACK, MSG_TYPE_SLOT_SWAP,
-    MSG_TYPE_STAGE_DEPLOY_REQ, MSG_TYPE_STAGE_DEPLOY_RESP,
+    MSG_TYPE_HEARTBEAT, MSG_TYPE_IT_PROGRESS, MSG_TYPE_IT_REPORT, MSG_TYPE_ROLLBACK,
+    MSG_TYPE_SLOT_SWAP, MSG_TYPE_STAGE_DEPLOY_REQ, MSG_TYPE_STAGE_DEPLOY_RESP,
 };
 use muconde_ipc::{
-    create_fory_runtime, HeartbeatTelemetry, RollbackCommand, SlotSwapCommand,
-    StageDeploymentRequest,
+    create_fory_runtime, HeartbeatTelemetry, IntegrationTestProgress, RollbackCommand,
+    SlotSwapCommand, StageDeploymentRequest,
 };
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -26,6 +26,10 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::btrfs::{BtrfsManager, CommandRunner, SystemCommandRunner};
 use crate::error::AgentError;
+use crate::gate::{
+    builtin_catalog, builtin_verdict, expand_integration_tests, GateTest, GateTracker,
+    IntegrationTestSelection,
+};
 use crate::slot::{Slot, SlotManager};
 use crate::telemetry::{
     now_unix_nano, trace_context_for_deployment, MuObserveCollectorSink, TelemetrySink,
@@ -48,6 +52,10 @@ pub struct MuConDeAgentConfig {
     pub default_warmup_timeout_secs: u64,
     pub required_consecutive_successes: u32,
     pub collector_addr: Option<String>,
+    /// Contract `integration_tests` selector (`"all"` by default).
+    pub integration_tests: IntegrationTestSelection,
+    /// Tests this agent can execute; `"all"` expands to this list.
+    pub gate_catalog: Vec<GateTest>,
 }
 
 impl Default for MuConDeAgentConfig {
@@ -62,6 +70,8 @@ impl Default for MuConDeAgentConfig {
             default_warmup_timeout_secs: 30,
             required_consecutive_successes: 3,
             collector_addr: std::env::var("MUOBSERVE_COLLECTOR_ADDR").ok(),
+            integration_tests: IntegrationTestSelection::All,
+            gate_catalog: builtin_catalog(),
         }
     }
 }
@@ -111,6 +121,33 @@ pub fn build_tls_server_config(
         .map_err(|e| AgentError::Tls(format!("Failed to configure server cert: {e}")))?;
 
     Ok(config)
+}
+
+/// Best-effort emission of `IntegrationTestProgress` frames (`MSG_TYPE_IT_PROGRESS`).
+///
+/// Progress is advisory: a write failure (for example a 0.1.x controller that already
+/// closed the stream) never aborts the gate. Returns the number of frames written.
+pub async fn send_it_progress<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    fory: &fory::Fory,
+    updates: &[IntegrationTestProgress],
+    sequence: u64,
+) -> usize {
+    let mut sent = 0usize;
+    for update in updates {
+        let bytes = match fory.serialize(update) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to serialize IntegrationTestProgress");
+                continue;
+            }
+        };
+        let hdr = IpcHeader::new(MSG_TYPE_IT_PROGRESS, bytes.len() as u32, 0, sequence);
+        if write_frame(stream, &hdr, &bytes).await.is_ok() {
+            sent += 1;
+        }
+    }
+    sent
 }
 
 /// Continuous delivery node agent running as a resident systemd daemon.
@@ -375,7 +412,20 @@ impl MuConDeAgent {
                     self.telemetry_sink.emit_spans(vec![swap_span]).await;
                     self.telemetry_sink.emit_metrics(vec![slot_metric]).await;
 
-                    // 2. Start warmup watchdog monitoring
+                    // 2. Integration gate: Pending for every contract test, then Running.
+                    let gate_tests = expand_integration_tests(
+                        &self.config.integration_tests,
+                        &self.config.gate_catalog,
+                    );
+                    let mut gate = GateTracker::new(&cmd.deployment_id, gate_tests);
+                    send_it_progress(&mut stream, &fory, &gate.pending_updates(), header.sequence)
+                        .await;
+                    let running = gate.start_all();
+                    send_it_progress(&mut stream, &fory, &running, header.sequence).await;
+                    let mut last_systemd_active: Option<bool> = None;
+                    let mut last_endpoint_ok: Option<bool> = None;
+
+                    // 3. Start warmup watchdog monitoring
                     let (tx, mut rx) = mpsc::channel(32);
                     let monitor = self.watchdog_monitor.clone();
                     let cmd_clone = cmd.clone();
@@ -397,6 +447,8 @@ impl MuConDeAgent {
 
                     // Forward telemetry ticks over stream and emit OtelMetricEntry batches
                     while let Some(telem) = rx.recv().await {
+                        last_systemd_active = Some(telem.systemd_active);
+                        last_endpoint_ok = Some(telem.health_endpoint_ok);
                         let ts_ns = now_unix_nano();
                         let probe_attrs = serde_json::json!({
                             "deployment_id": telem.deployment_id,
@@ -491,6 +543,17 @@ impl MuConDeAgent {
                             };
                             self.telemetry_sink.emit_spans(vec![rb_span]).await;
 
+                            // Final per-test progress before the aggregate verdict.
+                            let finished = gate.finish_remaining(|t| {
+                                builtin_verdict(
+                                    &t.name,
+                                    last_systemd_active,
+                                    last_endpoint_ok,
+                                    false,
+                                )
+                            });
+                            send_it_progress(&mut stream, &fory, &finished, header.sequence).await;
+
                             // Send IntegrationTestReport
                             let report_bytes = fory
                                 .serialize(&*report)
@@ -516,15 +579,21 @@ impl MuConDeAgent {
                             write_frame(&mut stream, &taint_header, &taint_bytes).await?;
                         }
                         Ok(Ok(WatchdogOutcome::WarmedUp { .. })) => {
+                            let finished = gate.finish_remaining(|_| true);
+                            send_it_progress(&mut stream, &fory, &finished, header.sequence).await;
                             tracing::info!(
                                 deployment_id = %cmd.deployment_id,
                                 "Warmup completed successfully"
                             );
                         }
                         Ok(Err(e)) => {
+                            let finished = gate.finish_remaining(|_| false);
+                            send_it_progress(&mut stream, &fory, &finished, header.sequence).await;
                             tracing::error!("Watchdog error: {}", e);
                         }
                         Err(join_err) => {
+                            let finished = gate.finish_remaining(|_| false);
+                            send_it_progress(&mut stream, &fory, &finished, header.sequence).await;
                             tracing::error!("Watchdog task join error: {}", join_err);
                         }
                     }
@@ -914,6 +983,210 @@ mod tests {
 
         drop(client);
         let _ = agent_task.await;
+    }
+
+    /// Drives one SlotSwapCommand and collects frames until `stop` returns true or 6 s elapse.
+    async fn run_swap_and_collect(
+        config: MuConDeAgentConfig,
+        prober: Arc<MockHealthProber>,
+        service: &str,
+        stop: impl Fn(&[(u16, Vec<u8>)]) -> bool,
+    ) -> Vec<(u16, Vec<u8>)> {
+        let srv_dir = config.muconde_root.join(service);
+        fs::create_dir_all(srv_dir.join("@a")).unwrap();
+        fs::create_dir_all(srv_dir.join("@b")).unwrap();
+        let runner = Arc::new(MockCommandRunner::new(true));
+        let agent = Arc::new(MuConDeAgent::new(config, runner, prober));
+        let (mut client, server) = tokio::io::duplex(256 * 1024);
+        let agent_server = agent.clone();
+        let agent_task = tokio::spawn(async move {
+            let _ = agent_server.handle_connection(server).await;
+        });
+
+        let fory = create_fory_runtime().unwrap();
+        let swap_cmd = SlotSwapCommand {
+            deployment_id: "dep-gate-1".into(),
+            lease_id: "lease-gate-1".into(),
+            service_name: service.into(),
+            from_slot: DeploymentSlot::SlotA,
+            to_slot: DeploymentSlot::SlotB,
+            systemd_unit: format!("{service}.service"),
+            warmup_timeout_secs: 5,
+        };
+        let bytes = fory.serialize(&swap_cmd).unwrap();
+        let hdr = IpcHeader::new(MSG_TYPE_SLOT_SWAP, bytes.len() as u32, 0, 7);
+        write_frame(&mut client, &hdr, &bytes).await.unwrap();
+
+        let mut frames = Vec::new();
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(6);
+        while !stop(&frames) {
+            match tokio::time::timeout_at(deadline, read_frame(&mut client)).await {
+                Ok(Ok((h, p))) => {
+                    assert_eq!(h.sequence, 7, "frames echo the command sequence");
+                    frames.push((h.msg_type, p));
+                }
+                _ => break,
+            }
+        }
+        drop(client);
+        let _ = agent_task.await;
+        frames
+    }
+
+    fn progress_of(frames: &[(u16, Vec<u8>)]) -> Vec<IntegrationTestProgress> {
+        let fory = create_fory_runtime().unwrap();
+        frames
+            .iter()
+            .filter(|(t, _)| *t == MSG_TYPE_IT_PROGRESS)
+            .map(|(_, p)| fory.deserialize(p).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_gate_emits_pending_running_passed_on_healthy_warmup() {
+        use crate::gate::{TEST_HEALTH_ENDPOINT_READY, TEST_SYSTEMD_UNIT_ACTIVE};
+        use muconde_ipc::TestState;
+
+        let temp = tempdir().unwrap();
+        let config = MuConDeAgentConfig {
+            node_id: "node-gate".into(),
+            muconde_root: temp.path().join("muconde"),
+            required_consecutive_successes: 2,
+            ..Default::default()
+        };
+        let frames = run_swap_and_collect(
+            config,
+            Arc::new(MockHealthProber::new(true)),
+            "action-runner",
+            |f| progress_of(f).len() >= 6,
+        )
+        .await;
+        let progress = progress_of(&frames);
+        assert_eq!(progress.len(), 6, "2 Pending + 2 Running + 2 Passed");
+        let states: Vec<TestState> = progress.iter().map(|p| p.state).collect();
+        assert_eq!(
+            states,
+            vec![
+                TestState::Pending,
+                TestState::Pending,
+                TestState::Running,
+                TestState::Running,
+                TestState::Passed,
+                TestState::Passed,
+            ]
+        );
+        assert_eq!(progress[0].test_name, TEST_SYSTEMD_UNIT_ACTIVE);
+        assert_eq!(progress[1].test_name, TEST_HEALTH_ENDPOINT_READY);
+        assert!(progress.iter().all(|p| p.critical));
+        assert!(progress.iter().all(|p| p.deployment_id == "dep-gate-1"));
+        assert!(progress[..4].iter().all(|p| p.duration_ms == 0));
+        // Two 250 ms probe ticks are needed, so Passed carries a real duration.
+        assert!(
+            progress[4].duration_ms >= 200,
+            "{}",
+            progress[4].duration_ms
+        );
+        // Pending/Running frames precede every health probe frame.
+        let first_probe = frames
+            .iter()
+            .position(|(t, _)| *t == MSG_TYPE_HEALTH_PROBE)
+            .unwrap();
+        assert!(first_probe >= 4);
+        // No aggregate report on success (unchanged behaviour).
+        assert!(!frames.iter().any(|(t, _)| *t == MSG_TYPE_IT_REPORT));
+    }
+
+    #[tokio::test]
+    async fn test_gate_reports_failed_critical_test_then_final_report_and_taint() {
+        use crate::gate::{TEST_HEALTH_ENDPOINT_READY, TEST_SYSTEMD_UNIT_ACTIVE};
+        use muconde_ipc::TestState;
+
+        let temp = tempdir().unwrap();
+        let config = MuConDeAgentConfig {
+            node_id: "node-gate-fail".into(),
+            muconde_root: temp.path().join("muconde"),
+            ..Default::default()
+        };
+        // systemd unit up, health endpoint down.
+        let prober = Arc::new(MockHealthProber::new(true));
+        prober
+            .endpoint_ok
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let frames = run_swap_and_collect(config, prober, "muregist", |f| {
+            f.iter().any(|(t, _)| *t == MSG_TYPE_ARTIFACT_TAINT)
+        })
+        .await;
+
+        let progress = progress_of(&frames);
+        assert_eq!(progress.len(), 6);
+        let finals = &progress[4..];
+        let sys = finals
+            .iter()
+            .find(|p| p.test_name == TEST_SYSTEMD_UNIT_ACTIVE)
+            .unwrap();
+        let hep = finals
+            .iter()
+            .find(|p| p.test_name == TEST_HEALTH_ENDPOINT_READY)
+            .unwrap();
+        assert_eq!(sys.state, TestState::Passed);
+        assert_eq!(hep.state, TestState::Failed);
+        assert!(hep.critical);
+
+        // Order: final progress, then the aggregate IntegrationTestReport, then the taint.
+        let types: Vec<u16> = frames.iter().map(|(t, _)| *t).collect();
+        let last_progress = types
+            .iter()
+            .rposition(|t| *t == MSG_TYPE_IT_PROGRESS)
+            .unwrap();
+        let report_idx = types.iter().position(|t| *t == MSG_TYPE_IT_REPORT).unwrap();
+        let taint_idx = types
+            .iter()
+            .position(|t| *t == MSG_TYPE_ARTIFACT_TAINT)
+            .unwrap();
+        assert!(last_progress < report_idx && report_idx < taint_idx);
+
+        let fory = create_fory_runtime().unwrap();
+        let report: IntegrationTestReport = fory.deserialize(&frames[report_idx].1).unwrap();
+        assert!(!report.passed);
+        assert_eq!(report.deployment_id, "dep-gate-1");
+    }
+
+    #[tokio::test]
+    async fn test_gate_honours_selected_integration_tests() {
+        use crate::gate::{IntegrationTestSelection, TEST_HEALTH_ENDPOINT_READY};
+
+        let temp = tempdir().unwrap();
+        let config = MuConDeAgentConfig {
+            node_id: "node-gate-sel".into(),
+            muconde_root: temp.path().join("muconde"),
+            required_consecutive_successes: 1,
+            integration_tests: IntegrationTestSelection::Selected(vec![
+                TEST_HEALTH_ENDPOINT_READY.into()
+            ]),
+            ..Default::default()
+        };
+        let frames = run_swap_and_collect(
+            config,
+            Arc::new(MockHealthProber::new(true)),
+            "action-runner",
+            |f| progress_of(f).len() >= 3,
+        )
+        .await;
+        let progress = progress_of(&frames);
+        assert_eq!(progress.len(), 3);
+        assert!(progress
+            .iter()
+            .all(|p| p.test_name == TEST_HEALTH_ENDPOINT_READY));
+    }
+
+    #[tokio::test]
+    async fn test_send_it_progress_is_best_effort_on_closed_stream() {
+        let fory = create_fory_runtime().unwrap();
+        let (client, mut server) = tokio::io::duplex(1024);
+        drop(client);
+        let gate = GateTracker::new("dep-x", builtin_catalog());
+        let sent = send_it_progress(&mut server, &fory, &gate.pending_updates(), 1).await;
+        assert_eq!(sent, 0);
     }
 
     #[test]
