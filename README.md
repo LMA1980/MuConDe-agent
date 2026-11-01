@@ -17,7 +17,7 @@
 
 Node-level continuous delivery daemon executing atomic filesystem operations, dual A/B root subvolume switching, health probes, and autonomous watchdog rollbacks.
 
-Resident systemd daemon operating natively across heterogeneous cluster nodes: SpacemiT K3 RISC-V (`pey-wail-deu`), Intel N100 (`entrance`), and Intel Xeon (`rubicon`).
+Resident systemd daemon operating natively across heterogeneous cluster nodes: SpacemiT K3 RISC-V (`worker-riscv64`), Intel N100 (`node-a`), and Intel Xeon (`storage-node`).
 
 ---
 
