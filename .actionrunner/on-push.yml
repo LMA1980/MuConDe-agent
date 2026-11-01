@@ -1,0 +1,22 @@
+version: "2"
+name: "MuConDe-agent Distributed Pipeline: Formatting, Clippy & Verification"
+
+stages:
+  - id: fmt-check
+    name: "Verify Rust Formatting"
+    tags: ["fmt"]
+    threads: 2
+    run: "cargo fmt --check"
+
+  - id: clippy-check
+    name: "Verify Rust Linter & Clippy Rules"
+    tags: ["clippy"]
+    threads: 4
+    run: "cargo clippy --all-targets -- -D warnings"
+
+  - id: test-muconde-agent
+    name: "Validate MuConDe-agent Test Suite"
+    tags: ["build", "test"]
+    depends_on: ["fmt-check", "clippy-check"]
+    threads: 4
+    run: "cargo test --all-targets"

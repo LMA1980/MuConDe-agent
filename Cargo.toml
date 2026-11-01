@@ -1,0 +1,27 @@
+[package]
+name = "muconde-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Node-level continuous delivery daemon executing atomic filesystem operations, dual A/B root subvolume switching, health probes, and autonomous watchdog rollbacks"
+license = "AGPL-3.0-only"
+repository = "https://github.com/LMA1980/MuConDe-agent"
+
+[dependencies]
+muconde-ipc = { git = "https://github.com/LMA1980/MuConDe-ipc.git", branch = "main" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "process", "net"] }
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pki-types = "1"
+fory = "1.7"
+zerocopy = { version = "0.8", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+rcgen = "0.14"
